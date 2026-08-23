@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=0.5, maximum-scale=5.0, user-scalable=yes, viewport-fit=cover">
-<title>安然宝贝-用户管理系统</title>
+<title>西红柿-用户管理系统</title>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
 <script src="https://pay.bite5678.fun/payment/payment-client.js?v=20260810-window-lock"></script>
@@ -174,7 +174,7 @@
 
 <header class="header">
   <div style="display:flex; align-items:center">
-    <div class="logo">⚡ 安然宝贝</div>
+    <div class="logo">⚡ 西红柿</div>
     <span class="sync-info" id="syncStatus">连接中...</span>
   </div>
   <div style="display:flex; gap:8px;">
@@ -186,12 +186,7 @@
 
 <div class="stats-bar" id="statsBar"></div>
 
-<div class="unused-container">
-  <div class="unused-box">
-    <div style="font-size: 11px; color: var(--unused); font-weight: bold;">🔑 待激活名额</div>
-    <div class="unused-list" id="unusedGrid"></div>
-  </div>
-</div>
+<div class="unused-container" id="unusedContainer"></div>
 
 <main class="main-content">
   <div class="table-wrap">
@@ -233,7 +228,7 @@
   <div class="modal" style="width:min(540px, calc(100vw - 24px));">
     <h3 style="font-size:16px; color:var(--accent); margin-bottom:8px;">修改窗口</h3>
     <div id="windowChangeUser" style="font-size:12px; color:#fff; margin-bottom:10px; white-space:pre-line;"></div>
-    <input id="windowChangeInput" class="edit-input" inputmode="numeric" autocomplete="off" placeholder="例如：150、50、+50 或 -50" oninput="updateWindowChangePreview()">
+    <input id="windowChangeInput" class="edit-input" inputmode="numeric" autocomplete="off" placeholder="例如：100、50、150；100口内只能 50 或 100" oninput="updateWindowChangePreview()">
     <div style="font-size:11px; color:#aab2c2; margin-top:7px;">不带符号＝修改后的总窗口数；带 + / - ＝在当前窗口数上增减。</div>
     <div id="windowChangePreview" style="font-size:12px; color:var(--accent); margin-top:10px; min-height:18px;"></div>
     <div class="window-change-warning" style="font-size:21px; color:#fff; line-height:1.55; margin-top:12px;">
@@ -327,9 +322,13 @@ const ROW_ID = 1;
 
 const DEFAULT_WINDOWS = '100';
 const DEFAULT_AMOUNT = '30';
+const ACTIVATION_AMOUNT_50 = 25;   // 激活 50 口金额（元）
+const ACTIVATION_AMOUNT_100 = 30;  // 激活 100 口金额（元）
+const TIER_WINDOWS_LOW = 50;
+const TIER_WINDOWS_HIGH = 100;
 const DEFAULT_PWD = '123456';
-const TARGET_ORG = '安然宝贝';
-const PAYMENT_TENANT = 'anran';
+const TARGET_ORG = '西红柿科技';
+const PAYMENT_TENANT = 'zhiyin';
 const PAYMENT_API_BASE = 'https://pay.bite5678.fun/payment-api/index.php';
 const WINDOW_CHANGE_BASE_CENTS = 3000;
 
@@ -342,7 +341,13 @@ function recordMonthlyAmountCents(record, allowZero = false) {
 }
 
 function formatMoneyCents(cents) {
-    return (Number(cents) / 100).toFixed(2);
+    return String(Number((Number(cents) / 100).toFixed(2)));
+}
+function cleanAmount(v, fallback) {
+  if (v === null || v === undefined || v === '') return fallback === undefined ? '' : fallback;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return String(v);
+  return String(n);
 }
 
 function validRenewalPriceOrAlert(record) {
@@ -385,6 +390,8 @@ let _saveRetryTimer = null;
 let _saveRevision = 0;
 let _isSyncing = false;
 let _isSyncingConnectors = false;
+let _lastConnectorsSyncAt = 0;
+let _lastVisibilitySyncAt = 0;
 let connectorHeartbeatById = new Map();
 let activeConnectors = [];
 let bitConnectorRoutes = [];
@@ -558,7 +565,7 @@ async function autoResumePendingPaidOrders() {
         const payment = await requestPaidOperation(
             'add_windows',
             [record.id],
-            `安然宝贝 · ${record.username} · 继续核销窗口订单`,
+            `西红柿 · ${record.username} · 继续核销窗口订单`,
             {
                 windowDelta: Number(lock.windowDelta),
                 pricingContext: `${lock.baseWindows}|${lock.currentAmountCents}|${lock.expiry}|${lock.pricingDate}`,
@@ -577,6 +584,92 @@ async function autoResumePendingPaidOrders() {
     } finally {
         _autoResumingPaidOrders = false;
     }
+}
+
+// ── 新窗口定价规则辅助函数 ──
+function tierWindowsFor(win) {
+    const w = Number(win);
+    if (!Number.isSafeInteger(w) || w < 0) return null;
+    if (w <= TIER_WINDOWS_HIGH) return w === TIER_WINDOWS_LOW ? TIER_WINDOWS_LOW : w === TIER_WINDOWS_HIGH ? TIER_WINDOWS_HIGH : null;
+    return w;
+}
+
+function activationAmountForWindows(win) {
+    const t = tierWindowsFor(win);
+    if (t === TIER_WINDOWS_LOW) return ACTIVATION_AMOUNT_50;
+    if (t === TIER_WINDOWS_HIGH) return ACTIVATION_AMOUNT_100;
+    if (t > TIER_WINDOWS_HIGH) return Math.round(ACTIVATION_AMOUNT_100 * t / 100);
+    return null;
+}
+
+function windowChangePlan(record, targetWindows, delta) {
+    const currentWindows = Number(record?.windows);
+    const target = Number(targetWindows);
+    const change = Number(delta);
+    const currentAmountCents = recordMonthlyAmountCents(record, true);
+    if (!Number.isSafeInteger(currentWindows) || currentWindows < 0 || !Number.isSafeInteger(target) || target < 0) {
+        return { ok:false, message:'当前窗口数或目标窗口数无效。' };
+    }
+    if (!Number.isSafeInteger(change) || change === 0 || target !== currentWindows + change) {
+        return { ok:false, message:'窗口变化无效。' };
+    }
+    if (target <= TIER_WINDOWS_HIGH && currentWindows <= TIER_WINDOWS_HIGH) {
+        if (currentWindows !== TIER_WINDOWS_LOW && currentWindows !== TIER_WINDOWS_HIGH) {
+            return { ok:false, message:'100 口以内的窗口数只有 50 口和 100 口两档，请先修正当前窗口数。' };
+        }
+        if (target !== TIER_WINDOWS_LOW && target !== TIER_WINDOWS_HIGH) {
+            return { ok:false, message:'100 口以内只能调整为 50 口或 100 口。' };
+        }
+        if (Math.abs(change) !== (TIER_WINDOWS_HIGH - TIER_WINDOWS_LOW)) {
+            return { ok:false, message:'100 口以内加减窗口只能 ±50 口（50 ↔ 100）。' };
+        }
+        if (change < 0) {
+            return {
+                ok:true,
+                newWindows: target,
+                newAmountCents: ACTIVATION_AMOUNT_50 * 100,
+                feeCents: 0,
+                message: ''
+            };
+        }
+        const diffCents = (ACTIVATION_AMOUNT_100 - ACTIVATION_AMOUNT_50) * 100;
+        const remainingDays = remainingWindowServiceDays(record.expiry);
+        if (remainingDays === null) {
+            return { ok:false, message:'到期日期无效，请先联系管理员修正。' };
+        }
+        const feeCents = Math.round(diffCents * remainingDays / 30);
+        return {
+            ok:true,
+            newWindows: target,
+            newAmountCents: ACTIVATION_AMOUNT_100 * 100,
+            feeCents: Number.isSafeInteger(feeCents) && feeCents >= 0 ? feeCents : 0,
+            message: ''
+        };
+    }
+    const baseCents = WINDOW_CHANGE_BASE_CENTS;
+    if (change > 0) {
+        const monthlyDeltaCents = Math.round(baseCents * change / 100);
+        const newAmountCents = currentAmountCents + monthlyDeltaCents;
+        const remainingDays = remainingWindowServiceDays(record.expiry);
+        if (remainingDays === null) return { ok:false, message:'到期日期无效，请先联系管理员修正。' };
+        const feeCents = Math.round(monthlyDeltaCents * remainingDays / 30);
+        return {
+            ok:true,
+            newWindows: target,
+            newAmountCents,
+            feeCents: Number.isSafeInteger(feeCents) && feeCents >= 0 ? feeCents : 0,
+            message: ''
+        };
+    }
+    const baseAmountCents = WINDOW_CHANGE_BASE_CENTS;
+    const newAmountCents = Math.round(baseAmountCents * target / 100);
+    return {
+        ok:true,
+        newWindows: target,
+        newAmountCents,
+        feeCents: 0,
+        message: ''
+    };
 }
 
 function parseWindowChangeInput(value, currentWindows) {
@@ -655,7 +748,7 @@ function updateWindowChangePreview() {
     const currentWindows = Number(record?.windows);
     const change = parseWindowChangeInput(document.getElementById('windowChangeInput').value, currentWindows);
     if (!record || !change) {
-        preview.textContent = '请输入最终窗口数（如 150、50），或输入相对变化（如 +50、-50）。';
+        preview.textContent = '请输入最终窗口数（如 100、50、150），100 口以内只能填 50 或 100。';
         return;
     }
     const { targetWindows, delta } = change;
@@ -663,15 +756,9 @@ function updateWindowChangePreview() {
         preview.textContent = `当前已经是 ${currentWindows} 窗口，无需修改。`;
         return;
     }
-    const monthlyDeltaCents = windowChangeMonthlyDeltaCents(delta);
-    const currentAmountCents = recordMonthlyAmountCents(record, true);
-    if (!Number.isSafeInteger(currentWindows) || currentWindows < 0 || targetWindows < 0 || currentAmountCents === null || monthlyDeltaCents === null) {
-        preview.textContent = '当前窗口数、金额或修改后的窗口数无效。';
-        return;
-    }
-    const newAmountCents = currentAmountCents + (delta > 0 ? monthlyDeltaCents : -monthlyDeltaCents);
-    if (newAmountCents < 0) {
-        preview.textContent = '修改后月费不能小于 0 元。';
+    const plan = windowChangePlan(record, targetWindows, delta);
+    if (!plan.ok) {
+        preview.textContent = plan.message;
         return;
     }
     if (delta > 0) {
@@ -684,15 +771,14 @@ function updateWindowChangePreview() {
             preview.textContent = '到期日当天或已过期，已无剩余计费天数，请先续费再增加窗口。';
             return;
         }
-        const feeCents = windowChangeFeeCents(delta, remainingDays);
-        if (!Number.isSafeInteger(feeCents) || feeCents < 1) {
-            preview.textContent = '本次增加窗口金额无效或低于最小支付金额，请联系管理员。';
+        if (!Number.isSafeInteger(plan.feeCents) || plan.feeCents < 1) {
+            preview.textContent = `${currentWindows} → ${targetWindows} 窗口；无需付款；新月费 ¥${formatMoneyCents(plan.newAmountCents)}`;
             return;
         }
-        preview.textContent = `${currentWindows} → ${targetWindows} 窗口；剩余 ${remainingDays} 天，本次支付 ¥${formatMoneyCents(feeCents)}；新月费 ¥${formatMoneyCents(newAmountCents)}`;
+        preview.textContent = `${currentWindows} → ${targetWindows} 窗口；剩余 ${remainingDays} 天，本次支付 ¥${formatMoneyCents(plan.feeCents)}；新月费 ¥${formatMoneyCents(plan.newAmountCents)}`;
         return;
     }
-    preview.textContent = `${currentWindows} → ${targetWindows} 窗口；无需付款、不退款；新月费 ¥${formatMoneyCents(newAmountCents)}`;
+    preview.textContent = `${currentWindows} → ${targetWindows} 窗口；无需付款、不退款；新月费 ¥${formatMoneyCents(plan.newAmountCents)}`;
 }
 
 async function confirmWindowChange() {
@@ -700,7 +786,7 @@ async function confirmWindowChange() {
     if (!recordId) return alert('找不到待修改的用户，请刷新后重试。');
     if (!(await ensureCloudInitializedForAction())) return false;
     try { await refreshWindowPaymentCloud(); } catch (error) { return alert(error?.message || error); }
-    let record = db.users.find(item => String(item.id) === String(recordId) && isTargetOwnerRecord(item));
+    let record = db.users.find(item => String(item.id) === String(recordId) && isOwnerInScope(item));
     if (!record) return alert('找不到该用户，请刷新后重试。');
     const resumablePayment = activeWindowPaymentLock(record);
     if (resumablePayment?.status === 'paid_pending' && resumablePayment.businessApplied) {
@@ -709,7 +795,7 @@ async function confirmWindowChange() {
             const payment = await requestPaidOperation(
                 'add_windows',
                 [recordId],
-                `安然宝贝 · ${record.username} · 继续核销窗口订单`,
+                `西红柿 · ${record.username} · 继续核销窗口订单`,
                 {
                     windowDelta: Number(resumablePayment.windowDelta),
                     pricingContext: `${resumablePayment.baseWindows}|${resumablePayment.currentAmountCents}|${resumablePayment.expiry}|${resumablePayment.pricingDate}`,
@@ -720,7 +806,7 @@ async function confirmWindowChange() {
             const result = await applyPaidWindowChange(payment, recordId);
             return Boolean(result?.completed);
         } catch (error) {
-            alert(`已付款订单暂未完成核销：\n${error?.message || error}\n\n请勿重复付款，稍后继续原操作。`);
+            alert(`已付款订单暂未完成核销：\n${bitSetupMessage(error)}\n\n请勿重复付款，稍后继续原操作。`);
             return false;
         }
     }
@@ -732,24 +818,20 @@ async function confirmWindowChange() {
         return alert(`检测到BitBrowser实际额度为 ${actualBeforePayment}，网页业务窗口为 ${currentWindows}，正在自动对账窗口和月费。请等待约10秒后再发起付款。`);
     }
     const change = parseWindowChangeInput(document.getElementById('windowChangeInput').value, currentWindows);
-    if (!change) return alert('请输入最终窗口数（如 150、50），或输入相对变化（如 +50、-50）。');
+    if (!change) return alert('请输入最终窗口数（如 100、50、150），100 口以内只能填 50 或 100。');
     const { targetWindows, delta } = change;
     if (delta === 0) return alert(`当前已经是 ${currentWindows} 窗口，无需修改。`);
-    const monthlyDeltaCents = windowChangeMonthlyDeltaCents(delta);
+    const plan = windowChangePlan(record, targetWindows, delta);
+    if (!plan.ok) return alert(plan.message);
     const currentAmountCents = recordMonthlyAmountCents(record, true);
-    if (!Number.isSafeInteger(currentWindows) || currentWindows < 0 || targetWindows < 0) return alert('修改后的窗口数必须是大于等于 0 的整数。');
-    if (currentAmountCents === null || monthlyDeltaCents === null) return alert('当前金额无效，请联系管理员修正。');
-    const newAmountCents = currentAmountCents + (delta > 0 ? monthlyDeltaCents : -monthlyDeltaCents);
-    if (newAmountCents < 0) return alert('修改后月费不能小于 0 元。');
+    if (currentAmountCents === null) return alert('当前金额无效，请联系管理员修正。');
     const remainingDays = delta > 0 ? remainingWindowServiceDays(record.expiry) : null;
     if (delta > 0 && remainingDays === null) return alert('当前到期日期无效，请先联系管理员修正。');
     if (delta > 0 && remainingDays === 0) return alert('到期日当天或已过期，已无剩余计费天数，请先续费再增加窗口。');
-    const feeCents = delta > 0 ? windowChangeFeeCents(delta, remainingDays) : 0;
-    if (delta > 0 && (!Number.isSafeInteger(feeCents) || feeCents < 1)) return alert('本次增加窗口金额低于最小支付金额，请联系管理员。');
-    const activeTask = activeWindowChangeTask(record);
-    if (activeTask) return alert('该员工号已有修改窗口任务未完成，请等待完成或先在联动状态中取消。');
+    const feeCents = delta > 0 ? plan.feeCents : 0;
+    if (activeWindowChangeTask(record)) return alert('该员工号已有修改窗口任务未完成，请等待完成或先在联动状态中取消。');
 
-    if (delta > 0) {
+    if (delta > 0 && feeCents > 0) {
         try {
             const pricingDate = getBeijingDateStr();
             const lock = await acquireWindowPaymentLock(record, {
@@ -757,7 +839,7 @@ async function confirmWindowChange() {
                 targetWindows,
                 windowDelta: delta,
                 currentAmountCents,
-                newAmountCents,
+                newAmountCents: plan.newAmountCents,
                 feeCents,
                 expiry: String(record.expiry || '').trim(),
                 pricingDate,
@@ -768,7 +850,7 @@ async function confirmWindowChange() {
             const payment = await requestPaidOperation(
                 'add_windows',
                 [recordId],
-                `安然宝贝 · ${record.username} · 增加${lock.windowDelta}窗口`,
+                `西红柿 · ${record.username} · 增加${lock.windowDelta}窗口`,
                 {
                     windowDelta: Number(lock.windowDelta),
                     pricingContext,
@@ -784,32 +866,41 @@ async function confirmWindowChange() {
         } catch (error) {
             const latest = findWindowPaymentRecord(recordId);
             const orderNo = latest?.windowPaymentLock?.orderNo;
-            alert(`窗口付款处理未完成：\n${error?.message || error}\n\n${orderNo ? '订单已保留为“已付款待处理”，请勿重复付款。订单号：' + orderNo : '尚未进入付款时不会扣款；已有订单时请稍后用相同窗口数继续。'}`);
+            alert(`窗口付款处理未完成：\n${bitSetupMessage(error)}\n\n${orderNo ? '订单已保留为“已付款待处理”，请勿重复付款。订单号：' + orderNo : '尚未进入付款时不会扣款；已有订单时请稍后用相同窗口数继续。'}`);
             return false;
         }
     }
 
     if (activeWindowPaymentLock(record)) {
-        return alert('该员工号已有付款订单进行中，付款完成或订单超时前不能减少窗口。');
+        return alert('该员工号已有付款订单进行中，付款完成或订单超时前不能修改窗口。');
     }
     closeWindowChangeModal();
 
     try {
-        enqueueWindowQuotaTask(record, targetWindows);
+        await enqueueBitJob(record, BIT_WINDOW_QUOTA_ACTION, newBitDedupeKey('window-quota', record, `${targetWindows}-${Date.now()}`), { targetWindowCount:targetWindows });
         record.windows = targetWindows;
         record.windowTarget = targetWindows;
-        record.amount = formatMoneyCents(newAmountCents);
-        recordOperationLog(record, 'window_reduce', { operatedAt:new Date().toISOString(), windows:targetWindows, amount:record.amount });
+        record.amount = formatMoneyCents(plan.newAmountCents);
+        recordOperationLog(record, delta > 0 ? 'window_add' : 'window_reduce', { operatedAt:new Date().toISOString(), windows:targetWindows, amount:record.amount });
         saveToCloud();
         render();
-        alert(`已提交减少窗口任务：${currentWindows} → ${targetWindows}，无需付款。`);
+        alert(`已提交${delta > 0 ? '增加' : '减少'}窗口任务：${currentWindows} → ${targetWindows}${delta > 0 ? '，无需付款' : '，无需付款、不退款'}。`);
         return true;
     } catch (error) {
-        alert(`减少窗口任务创建失败：\n${error?.message || error}`);
+        alert(`${delta > 0 ? '增加' : '减少'}窗口任务创建失败：\n${bitSetupMessage(error)}`);
         return false;
     }
 }
 
+
+function normAmount(v) {
+    if (v === undefined || v === null || v === '') return v;
+    const n = Number(v);
+    return Number.isFinite(n) ? String(n) : v;
+}
+function cleanAmountList(arr) {
+    return Array.isArray(arr) ? arr.map(u => (u && typeof u === 'object') ? { ...u, amount: normAmount(u.amount) } : u) : [];
+}
 function normalizeDb(content) {
     if (typeof content === 'string') {
         try { content = JSON.parse(content); } catch (e) { content = {}; }
@@ -817,9 +908,9 @@ function normalizeDb(content) {
     const value = content && typeof content === 'object' ? content : {};
     return {
         ...value,
-        users: Array.isArray(value.users) ? value.users : [],
-        unused: Array.isArray(value.unused) ? value.unused : [],
-        trash: Array.isArray(value.trash) ? value.trash : [],
+        users: cleanAmountList(value.users),
+        unused: cleanAmountList(value.unused),
+        trash: cleanAmountList(value.trash),
         bitTasks: Array.isArray(value.bitTasks) ? value.bitTasks : [],
         bitConnectors: Array.isArray(value.bitConnectors) ? value.bitConnectors : [],
         bitInventory: Array.isArray(value.bitInventory) ? value.bitInventory : [],
@@ -980,6 +1071,11 @@ function escapeHtml(value) {
     })[char]);
 }
 
+function displayOwnerName(value) {
+    const owner = String(value ?? '').trim();
+    return owner === TARGET_ORG ? '西红柿' : (owner || '-');
+}
+
 function findBitTaskSourceRecord(task, state = db) {
     const sourceId = String(task?.sourceRecordId || task?.source_record_id || '');
     const username = String(task?.username || '').trim().toLowerCase();
@@ -1097,9 +1193,9 @@ function renderOperationLogs() {
     if (count) count.textContent=search ? `（搜索结果 ${visible.length}/${logs.length}）` : `（共 ${logs.length} 条）`;
     const rows=visible.map(log => `<div class="operation-log-row">
         <div><b>${escapeHtml(log.username || '-')}</b></div><div>${escapeHtml(log.wechat || '-')}</div><div>${escapeHtml(OPERATION_ACTION_LABELS[log.action] || log.action || '-')}</div>
-        <div>${escapeHtml(log.windows || '-')}</div><div>${(log.amount || log.paymentAmount) ? '¥' + escapeHtml(log.amount || log.paymentAmount) : '-'}</div>
+        <div>${escapeHtml(log.windows || '-')}</div><div>${(log.amount || log.paymentAmount) ? '¥' + escapeHtml(cleanAmount(log.amount || log.paymentAmount)) : '-'}</div>
         <div>${escapeHtml(formatOperationTime(log.operatedAt))}</div>
-        <div>${escapeHtml(log.expiryBefore || '-')}</div><div>${escapeHtml(log.expiryAfter || '-')}</div><div>${escapeHtml(log.owner || '-')}</div>
+        <div>${escapeHtml(log.expiryBefore || '-')}</div><div>${escapeHtml(log.expiryAfter || '-')}</div><div>${escapeHtml(displayOwnerName(log.owner))}</div>
     </div>`).join('');
     list.innerHTML=`<div class="operation-log-row operation-log-header"><div>员工号</div><div>微信</div><div>操作</div><div>窗口</div><div>金额</div><div>操作时间</div><div>续费前到期</div><div>续费后到期</div><div>归属</div></div>` +
         (rows || `<div style="text-align:center; padding:38px; color:#fff;">${search ? '没有找到匹配日志' : '暂无操作日志'}</div>`);
@@ -1274,6 +1370,9 @@ function renderBitIntegration() {
 
 async function syncConnectors(silent = true) {
     if (_isSyncingConnectors) return;
+    const _nowMs = Date.now();
+    if (silent && _nowMs - _lastConnectorsSyncAt < 30000) return;
+    _lastConnectorsSyncAt = _nowMs;
     _isSyncingConnectors = true;
     const pruned = pruneExpiredConnectors();
     if (pruned && lastKnownUpdatedAt && !_hasPendingSave) saveToCloud(true);
@@ -1334,6 +1433,7 @@ async function syncFromCloud(silent = false) {
         if (!silent) document.getElementById('syncStatus').innerText='☁️ 正在完成当前同步...';
         return;
     }
+    // 如果正在保存或者本地刚做了修改还在排队，一律跳过拉取，防止云端旧数据覆盖正在处理的表单！
     if (_isSaving || _hasPendingSave) {
         if (!silent && !lastKnownUpdatedAt && !_isSaving) {
             clearTimeout(_saveTimer);_saveTimer=null;_hasPendingSave=false;_isSilentSave=false;
@@ -1381,6 +1481,8 @@ async function syncFromCloud(silent = false) {
 
         if (data && data.content) {
             lastKnownUpdatedAt = data.updated_at || 'FRESH';
+            localStorage.setItem(STORAGE_KEY + '_version', lastKnownUpdatedAt);
+            // 兼容 content 可能是字符串或对象
             let parsed = data.content;
             if (typeof parsed === 'string') {
                 try { parsed = JSON.parse(parsed); } catch(e) { parsed = {}; }
@@ -1395,6 +1497,7 @@ async function syncFromCloud(silent = false) {
         }
     } catch (err) {
         console.error('[sync] 同步失败:', err);
+        // 同步失败时尝试从 localStorage 恢复
         const local = localStorage.getItem(STORAGE_KEY);
         if (local) {
             try { db = normalizeDb(JSON.parse(local)); rebuildActiveConnectors(); render(); } catch(e) {}
@@ -1407,8 +1510,24 @@ async function syncFromCloud(silent = false) {
     }
 }
 
+// 防抖保存：多次快速编辑只触发一次上传
 function saveToCloud(silent = false) {
     _isSilentSave = _hasPendingSave ? (_isSilentSave && silent) : Boolean(silent);
+    // 自动清理 30 天前的操作日志，减少 MainData.content 体积，从而减少每次全量下载流量
+    db.operationLogs = (db.operationLogs || []).filter(log => {
+        const ts = Date.parse(log && (log.operatedAt || log.createdAt) || '');
+        return !ts || ts >= Date.now() - 30 * 86400000;
+    });
+    // 已完成/已取消/已解决的任务只保留最近 300 条，避免 MainData.content 无限膨胀
+    {
+        const terminalStatuses = new Set(['success', 'cancelled', 'resolved']);
+        const activeTasks = (db.bitTasks || []).filter(task => !terminalStatuses.has(String(task.status || '')));
+        const terminalTasks = (db.bitTasks || [])
+            .filter(task => terminalStatuses.has(String(task.status || '')))
+            .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))
+            .slice(0, 300);
+        db.bitTasks = [...activeTasks, ...terminalTasks];
+    }
     _saveRevision += 1;
     _hasPendingSave = true;
     localStorage.setItem(STORAGE_KEY, JSON.stringify(buildMainDataPayload()));
@@ -1445,18 +1564,20 @@ async function _doSaveToCloud() {
     try {
         let opResult;
         if (lastKnownUpdatedAt === 'FRESH') {
-            opResult = await supabaseClient.from('MainData').upsert({ id: ROW_ID, content: payload, updated_at: currentNow }).select();
+            opResult = await supabaseClient.from('MainData').upsert({ id: ROW_ID, content: payload, updated_at: currentNow }).select('updated_at');
         } else {
             opResult = await supabaseClient.from('MainData')
                 .update({ content: payload, updated_at: currentNow })
                 .eq('id', ROW_ID)
                 .eq('updated_at', lastKnownUpdatedAt)
-                .select();
+                .select('updated_at');
         }
         if (opResult.error) throw opResult.error;
 
         if (lastKnownUpdatedAt !== 'FRESH' && (!opResult.data || opResult.data.length === 0)) {
             conflictDetected = true;
+            clearTimeout(_saveTimer);
+            _saveTimer = null;
             _hasPendingSave = true;
             if (!isSilent) _isSilentSave = false;
             statusEl.innerHTML = `<span style="color:var(--warning);font-weight:bold;">☁️ 检测到多人同时操作，正在安全合并...</span>`;
@@ -1471,6 +1592,7 @@ async function _doSaveToCloud() {
         }
 
         lastKnownUpdatedAt = currentNow;
+        localStorage.setItem(STORAGE_KEY + '_version', lastKnownUpdatedAt);
         baseSnapshot = snapshotMainData(payload);
         if (_saveRevision !== revisionAtStart) {
             _hasPendingSave = true;
@@ -1493,7 +1615,7 @@ async function _doSaveToCloud() {
         }
     } finally {
         _isSaving = false;
-        if (_hasPendingSave && !_saveRetryTimer && !conflictDetected) scheduleCloudSave(80);
+        if (_hasPendingSave && !_saveRetryTimer && !conflictDetected) scheduleCloudSave(500);
     }
 }
 
@@ -1564,6 +1686,7 @@ async function autoResolveConflict() {
             if (localChanged && remoteChanged && !sameValue(localValue, remoteValue)) {
                 const localQuota = key === 'windows' ? activeQuotaTask(localData, localRecord) : null;
                 const remoteQuota = key === 'windows' ? activeQuotaTask(latestData, remoteRecord) : null;
+                // BitBrowser目录自动回写不能覆盖本页明确下发的窗口任务；若两边都是人工任务，云端先保存者优先。
                 chosen = localQuota && !remoteQuota ? localValue : remoteValue;
                 if (localQuota && remoteQuota && String(localQuota.id) !== String(remoteQuota.id)) discardedLocalTaskIds.add(String(localQuota.id));
                 if (fieldLabels[key] && !(key === 'windows' && localQuota && !remoteQuota)) {
@@ -1906,14 +2029,14 @@ function render(forceSort = false) {
         const bitBadge = bitBadgeForRecord(u);
         tr.innerHTML = `
             <td><button class="btn btn-ghost btn-sm" onclick="copyUserSummary('${u.id}')">复制</button></td>
-            <td class="owner-cell">${u.owner || '-'}</td>
+            <td class="owner-cell">${escapeHtml(displayOwnerName(u.owner))}</td>
             <td class="window-cell">${u.windows ?? DEFAULT_WINDOWS}</td>
             <td class="copy-on-click user-cell" title="单击复制用户名"><b>${u.username}</b></td>
             <td class="copy-on-click" title="单击复制密码">${u.password || DEFAULT_PWD}</td>
             <td class="editable wechat-cell" data-f="wechat">${u.wechat||'-'}</td>
             <td>${u.activeTime || '-'}</td>
             <td>${u.expiry}</td>
-            <td class="amount-cell" style="color:var(--accent)">${u.amount || DEFAULT_AMOUNT}</td>
+            <td class="amount-cell" style="color:var(--accent)">${cleanAmount(u.amount, DEFAULT_AMOUNT)}</td>
             <td class="status-cell"><span style="color:var(--${st}); font-size:10px; font-weight:bold">${st==='expiring'?'⚠️到期':st==='active'?'✅有效':'❌过期'}</span></td>
             <td class="window-change-cell"><button class="btn btn-ghost btn-sm" onclick="openWindowChangeModal('${u.id}')">修改</button></td>
             <td class="row-actions">
@@ -1942,7 +2065,7 @@ function renderTrash() {
             <div style="overflow:hidden; text-overflow:ellipsis"><b>${u.username}</b></div>
             <div>${u.wechat || '-'}</div>
             <div style="color:var(--accent)">${(u.expiry||'').slice(5)}</div>
-            <div>¥${u.amount || '0'}</div>
+            <div>¥${cleanAmount(u.amount, '0')}</div>
             <div><button class="btn btn-success btn-sm" onclick="renewFromTrash('${u.id}')">续费</button></div>
         </div>
     `).join('') || '<div style="text-align:center; padding:40px; color:var(--text3)">空</div>';
@@ -1955,8 +2078,8 @@ async function renewFromTrash(id) {
     let record = db.trash[index];
     let renewalPrice = validRenewalPriceOrAlert(record);
     if (renewalPrice === null) return false;
-    if (!(await showActionConfirm(`确定为“${record.username}”续费30天并恢复 BitBrowser 员工号？\n\n窗口：${record.windows}\n需支付：¥${renewalPrice.toFixed(2)}`, { title:'续费恢复确认', confirmText:'确认并支付' }))) return false;
-    const payment = await requestPaidOperation('restore', [id], `安然宝贝 · ${record.username} · ${record.windows}窗口续费`);
+    if (!(await showActionConfirm(`确定为“${record.username}”续费30天并恢复 BitBrowser 员工号？\n\n窗口：${record.windows}\n需支付：¥${Number(renewalPrice)}`, { title:'续费恢复确认', confirmText:'确认并支付' }))) return false;
+    const payment = await requestPaidOperation('restore', [id], `西红柿 · ${record.username} · ${record.windows}窗口续费`);
     if (!payment) return false;
     if (paymentAlreadyApplied(payment, id, 'renew')) {
         await completePaidOperation(payment, { recordIds:[String(id)], action:'restore', duplicatePrevented:true });
@@ -2009,8 +2132,10 @@ async function activate(id) {
     if (!(await ensureCloudInitializedForAction())) return false;
     let u = db.unused.find(x => x.id === id);
     if(!u) return false;
-    if (!(await showActionConfirm(`确定激活“${u.username}”？\n\n默认窗口数${DEFAULT_WINDOWS}\n需支付：¥${Number(DEFAULT_AMOUNT).toFixed(2)}`, { title:'激活确认', confirmText:'确认并支付' }))) return false;
-    const payment = await requestPaidOperation('activate', [id], `安然宝贝 · ${u.username} 激活`);
+    const quotaWin = Number(u.windows) === TIER_WINDOWS_LOW ? TIER_WINDOWS_LOW : TIER_WINDOWS_HIGH;
+    const quotaAmount = quotaWin === TIER_WINDOWS_LOW ? ACTIVATION_AMOUNT_50 : ACTIVATION_AMOUNT_100;
+    if (!(await showActionConfirm(`确定激活“${u.username}”？\n\n窗口数${quotaWin}\n需支付：¥${quotaAmount}`, { title:'激活确认', confirmText:'确认并支付' }))) return false;
+    const payment = await requestPaidOperation('activate', [id], `西红柿 · ${u.username} 激活`);
     if (!payment) return false;
     if (!(await ensureCloudInitializedForAction())) {
         alert('✅ 已确认付款，但暂时无法同步云端数据。请不要再次付款，稍后用同一页面重试。');
@@ -2032,8 +2157,8 @@ async function activate(id) {
         password: u.password, 
         owner: TARGET_ORG, 
         wechat: '-', 
-        amount: DEFAULT_AMOUNT, 
-        windows: DEFAULT_WINDOWS, 
+        amount: String(quotaAmount), 
+        windows: String(quotaWin), 
         activeTime, 
         expiry: now.toISOString().slice(0,10), 
         isStarred: false 
@@ -2056,7 +2181,7 @@ function showRenewalConfirm(record, nextExpiry, amount = null) {
     document.getElementById('renewalConfirmCurrentExpiry').textContent = record.expiry || '-';
     document.getElementById('renewalConfirmNextExpiry').textContent = nextExpiry || '-';
     document.getElementById('renewalConfirmWindows').textContent = String(record.windows || 0);
-    document.getElementById('renewalConfirmAmount').textContent = showPaymentDetails ? `¥${Number(amount).toFixed(2)}` : '';
+    document.getElementById('renewalConfirmAmount').textContent = showPaymentDetails ? `¥${Number(amount)}` : '';
     document.getElementById('renewalConfirmWindowsRow').hidden = !showPaymentDetails;
     document.getElementById('renewalConfirmAmountRow').hidden = !showPaymentDetails;
     const modal = document.getElementById('renewalConfirmModal');
@@ -2110,7 +2235,7 @@ async function quickRenew(id) {
     if (renewalPrice === null) return false;
     const renewalPreviewExpiry = getRenewedExpiry(u);
     if (!(await showRenewalConfirm(u, renewalPreviewExpiry, renewalPrice))) return false;
-    const payment = await requestPaidOperation('renew', [id], `安然宝贝 · ${u.username} · ${u.windows}窗口续费`);
+    const payment = await requestPaidOperation('renew', [id], `西红柿 · ${u.username} · ${u.windows}窗口续费`);
     if (!payment) return false;
     if (paymentAlreadyApplied(payment, id, 'renew')) {
         await completePaidOperation(payment, { recordIds:[String(id)], action:'renew', duplicatePrevented:true });
@@ -2170,15 +2295,31 @@ function renderStatsBar() {
     }).join('');
 }
 
+function unusedWindows(u) {
+    const w = Number(u && (u.windows ?? 0));
+    return Number.isFinite(w) && w > 0 ? w : Number(TIER_WINDOWS_HIGH || 100);
+}
+
 function renderUnusedGrid() {
-    document.getElementById('unusedGrid').innerHTML = db.unused.map(u => `
-        <div class="unused-item">
-            <span>${u.username}</span>
-            <button class="btn" 
-                    style="height:18px; font-size:9px; background-color: #2ed573; color: #000000; border: none; font-weight: bold;" 
-                    onclick="activate('${u.id}')">激活</button>
-        </div>
-    `).join('');
+    const container = document.getElementById('unusedContainer');
+    if (!container) return;
+    const groups = new Map();
+    db.unused.forEach(u => {
+        const w = unusedWindows(u);
+        if (!groups.has(w)) groups.set(w, []);
+        groups.get(w).push(u);
+    });
+    const keys = Array.from(groups.keys()).sort((a, b) => b - a);
+    container.innerHTML = keys.map(w => {
+        const items = groups.get(w).map(u => {
+            const username = escapeHtml(String(u.username ?? ''));
+            return `<div class="unused-item"><span>${username}</span><button class="btn" style="height:18px; font-size:9px; background-color: #2ed573; color: #000000; border: none; font-weight: bold;" onclick="activate('${u.id}')">激活</button></div>`;
+        }).join('');
+        return `<div class="unused-box">
+      <div style="font-size: 11px; color: var(--unused); font-weight: bold;">🔑 待激活名额（${w}窗口）</div>
+      <div class="unused-list">${items}</div>
+    </div>`;
+    }).join('');
 }
 
 function makeEditable(el, id, field) {
@@ -2189,12 +2330,12 @@ function makeEditable(el, id, field) {
     input.value = oldVal;
     el.innerHTML = ''; el.appendChild(input); input.focus();
     input.onblur = () => {
-      if (input._saved) return;
+      if (input._saved) return; // 防止重复触发
       input._saved = true;
       const u = db.users.find(x => x.id === id);
       if(u) {
         const rawValue = input.value.trim();
-        u[field] = rawValue || '-';
+        u[field] = (field === 'amount') ? (normAmount(rawValue) || '-') : (rawValue || '-');
         saveToCloud();
       }
       render();
@@ -2223,6 +2364,7 @@ function showLoading(s, options = {}) {
     mask.style.display = s ? 'flex' : 'none';
 }
 
+// 页面加载：先从 localStorage 快速恢复，再从云端同步
 (function initLoad() {
     const local = localStorage.getItem(STORAGE_KEY);
     if (local) {
@@ -2232,10 +2374,16 @@ function showLoading(s, options = {}) {
             render();
         } catch(e) {}
     }
+    const cachedVersion = localStorage.getItem(STORAGE_KEY + '_version');
+    if (cachedVersion) lastKnownUpdatedAt = cachedVersion;
+    if (typeof baseSnapshot !== 'undefined' && !baseSnapshot) {
+        baseSnapshot = JSON.parse(JSON.stringify(db));
+    }
     syncFromCloud();
     syncConnectors(true);
 })();
 
+// 页面关闭前确保数据保存
 window.addEventListener('beforeunload', () => {
     const payload = buildMainDataPayload();
     localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
@@ -2252,14 +2400,18 @@ window.addEventListener('beforeunload', () => {
     }
 });
 setInterval(() => {
-    if (document.visibilityState === 'visible') {
+    if (document.visibilityState === 'visible' && (document.hasFocus ? document.hasFocus() : true)) {
         syncFromCloud(true);
     }
-}, 60000);
+}, 120000);
 document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
-        syncFromCloud(true);
-        syncConnectors(true);
+        const _nowMs = Date.now();
+        if (_nowMs - _lastVisibilitySyncAt >= 10000) {
+            _lastVisibilitySyncAt = _nowMs;
+            syncFromCloud(true);
+            syncConnectors(true);
+        }
     }
 });
 </script>
